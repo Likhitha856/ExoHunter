@@ -1,0 +1,196 @@
+# =========================
+# Full ExoFusion Hybrid Pipeline (XGBoost + CNN + Fusion)
+# with Choose File Exoplanet Check at the end
+# Handles CSV comment lines correctly
+# =========================
+
+# 1) Install required packages
+!pip install -q xgboost shap tensorflow==2.12.0 scikit-learn plotly seaborn pandas numpy matplotlib
+
+# 2) Imports
+import os, io, warnings
+warnings.filterwarnings("ignore")
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.graph_objects as go
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, roc_auc_score
+import xgboost as xgb
+import shap
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from google.colab import files
+from IPython.display import display
+
+# GPU info
+print("TF version:", tf.__version__)
+print("Num GPUs Available:", len(tf.config.list_physical_devices('GPU')))
+
+# Paths
+MODEL_DIR = "/content/models"
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+# =========================
+# Dataset Loading / Generation
+# =========================
+KOI_URL = "https://exoplanetarchive.ipac.caltech.edu/TblView/nph-tblView?config=KOI&format=csv"
+
+def load_or_generate_dataset():
+    try:
+        print("Attempting to download KOI CSV from NASA Exoplanet Archive...")
+        # skip comment lines
+        df = pd.read_csv(KOI_URL, comment='#')
+        print("Downloaded KOI table with shape:", df.shape)
+        # Keep only relevant columns
+        cols = [c for c in ['koi_period','koi_depth','koi_duration','koi_impact','koi_prad','koi_disposition'] if c in df.columns]
+        df = df[cols].copy()
+        # Normalize disposition
+        if 'koi_disposition' in df.columns:
+            df['koi_disposition'] = df['koi_disposition'].astype(str).str.upper()
+            df = df[df['koi_disposition'].isin(['CANDIDATE','CONFIRMED','FALSE POSITIVE','FALSE_POSITIVE','FALSE_POS'])]
+            df['label'] = df['koi_disposition'].apply(lambda x: 0 if 'FALSE' in x else 1)
+        else:
+            raise ValueError("Disposition column missing in KOI fetch -> fallback")
+        # Fill numeric columns
+        for c in ['koi_period','koi_depth','koi_duration','koi_impact','koi_prad']:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce').fillna(df[c].median())
+            else:
+                df[c] = 0
+        df = df[['koi_period','koi_depth','koi_duration','koi_impact','koi_prad','label']].dropna().reset_index(drop=True)
+        df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+        if df.shape[0] < 500:
+            raise ValueError("KOI table too small, using synthetic instead.")
+        return df
+    except Exception as e:
+        print("Could not download KOI CSV. Generating synthetic dataset. Error:", e)
+        # synthetic dataset
+        n = 9000
+        rng = np.random.RandomState(42)
+        koi_period = 10**rng.uniform(np.log10(0.3), np.log10(500), n)
+        koi_depth = rng.exponential(scale=200, size=n) / 1e5
+        koi_duration = np.clip(rng.normal(3,1,n), 0.1, 20)
+        koi_impact = np.clip(rng.beta(2,2,n), 0, 1)
+        koi_prad = np.clip(rng.normal(2,1,n), 0.1, 20)
+        prob = (koi_depth*1e5) * (1/(1+np.exp(-(koi_prad-1.2)))) * (1/(1+np.log1p(koi_period)))
+        prob = (prob - prob.min())/(prob.max()-prob.min())
+        label = (prob + 0.1*rng.randn(n) > 0.5).astype(int)
+        df = pd.DataFrame({
+            'koi_period': koi_period,
+            'koi_depth': koi_depth,
+            'koi_duration': koi_duration,
+            'koi_impact': koi_impact,
+            'koi_prad': koi_prad,
+            'label': label
+        })
+        return df
+
+df = load_or_generate_dataset()
+print("Dataset sample:")
+display(df.head())
+
+# =========================
+# Exploratory Graphs
+# =========================
+print("\nPlotting pairplot...")
+sns.pairplot(df, hue='label')
+plt.show()
+
+print("\nLabel distribution:")
+sns.countplot(x='label', data=df)
+plt.show()
+
+# =========================
+# Preprocessing for ML
+# =========================
+X = df[['koi_period','koi_depth','koi_duration','koi_impact','koi_prad']].values
+y = df['label'].values
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42, stratify=y)
+
+# =========================
+# XGBoost Model
+# =========================
+xgb_model = xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='logloss')
+xgb_model.fit(X_train, y_train)
+y_pred_xgb = xgb_model.predict(X_test)
+
+print("\nXGBoost Classification Report:")
+print(classification_report(y_test, y_pred_xgb))
+
+# =========================
+# Simple CNN Model
+# =========================
+X_train_cnn = X_train.reshape(-1,5,1)
+X_test_cnn = X_test.reshape(-1,5,1)
+
+cnn_model = models.Sequential([
+    layers.Conv1D(32, 2, activation='relu', input_shape=(5,1)),
+    layers.MaxPooling1D(2),
+    layers.Flatten(),
+    layers.Dense(32, activation='relu'),
+    layers.Dense(1, activation='sigmoid')
+])
+cnn_model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+cnn_model.fit(X_train_cnn, y_train, epochs=5, batch_size=32, verbose=1)
+y_pred_cnn = (cnn_model.predict(X_test_cnn) > 0.5).astype(int)
+
+print("\nCNN Classification Report:")
+print(classification_report(y_test, y_pred_cnn))
+
+# =========================
+# Fusion (Simple average)
+# =========================
+y_pred_fusion = ((y_pred_xgb + y_pred_cnn.flatten()) / 2 > 0.5).astype(int)
+print("\nFusion Classification Report:")
+print(classification_report(y_test, y_pred_fusion))
+
+# =========================
+# SHAP importance for XGBoost
+# =========================
+explainer = shap.Explainer(xgb_model)
+shap_values = explainer(X_test)
+shap.summary_plot(shap_values, X_test, feature_names=['koi_period','koi_depth','koi_duration','koi_impact','koi_prad'])
+
+# =========================
+# Final Step: Upload CSV to Check Exoplanets
+# =========================
+print("\n=== Upload a CSV to check for exoplanets ===")
+uploaded = files.upload()
+
+if uploaded:
+    fname = list(uploaded.keys())[0]
+    user_df = pd.read_csv(io.BytesIO(uploaded[fname]), comment='#')  # <-- ignore comment lines
+    print(f"\nUploaded file '{fname}' loaded with shape: {user_df.shape}\n")
+
+    # Determine exoplanet presence
+    if 'label' in user_df.columns:
+        n_planets = user_df['label'].sum()
+        if n_planets > 0:
+            print("✅ Exoplanet fetched!")
+        elif n_planets == 0:
+            print("❌ No exoplanet found.")
+        else:
+            print("⚠️ Uncertain data in file.")
+    elif 'koi_disposition' in user_df.columns:
+        if user_df['koi_disposition'].str.contains('CANDIDATE|CONFIRMED', case=False).any():
+            print("✅ Exoplanet fetched!")
+        else:
+            print("❌ No exoplanet found.")
+    else:
+        print("⚠️ Cannot determine exoplanet presence. Column missing.")
+
+    # Optional: Basic numeric plots for uploaded file
+    numeric_cols = user_df.select_dtypes(include=np.number).columns.tolist()
+    if numeric_cols:
+        print("\nPlotting uploaded data pairplot...")
+        sns.pairplot(user_df[numeric_cols], hue='label' if 'label' in user_df.columns else None)
+        plt.show()
+else:
+    print("No file uploaded. Skipping exoplanet check.")
